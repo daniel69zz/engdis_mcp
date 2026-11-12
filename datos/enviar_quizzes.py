@@ -1,6 +1,6 @@
 # envía los quizzes de datos/quiz/respuestas.json con las herramientas del MCP
 import asyncio, sys, json, re
-sys.path.insert(0, "/Users/luisdanielrojascaceres/Downloads/proyecto_ingles/engdis_mcp")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))  # carpeta del proyecto
 import server as S
 
 async def main():

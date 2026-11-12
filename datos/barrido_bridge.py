@@ -2,7 +2,7 @@
 # que deja leídos en datos/quiz/UxLy.txt (+ capturas) para responderlos aparte
 import asyncio, sys, time, json
 from pathlib import Path
-sys.path.insert(0, "/Users/luisdanielrojascaceres/Downloads/proyecto_ingles/engdis_mcp")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))  # carpeta del proyecto
 import server as S
 
 CURSO = "TOEIC Bridge"

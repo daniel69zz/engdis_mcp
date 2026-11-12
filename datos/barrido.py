@@ -1,6 +1,6 @@
 # barrido de prueba: corre practica_resolver en todas las prácticas de las unidades 1-6
 import asyncio, sys, time
-sys.path.insert(0, "/Users/luisdanielrojascaceres/Downloads/proyecto_ingles/engdis_mcp")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))  # carpeta del proyecto
 import server as S
 
 async def main():
@@ -22,7 +22,7 @@ async def main():
             print(f"U{u}L{l} ({time.time()-t:.0f}s): {sum('OK' in x for x in log)} OK; " + (" | ".join(malos) if malos else "completa"), flush=True)
             if malos:
                 pg = await S._pagina()
-                await pg.screenshot(path=f"/Users/luisdanielrojascaceres/Downloads/proyecto_ingles/engdis_mcp/datos/barrido_U{u}L{l}.jpg", type="jpeg", quality=50)
+                await pg.screenshot(path=str(S.DATOS / f"barrido_U{u}L{l}.jpg"), type="jpeg", quality=50)
     await S._ctx.close()
 
 asyncio.run(main())
