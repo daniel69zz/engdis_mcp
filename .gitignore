@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.DS_Store
+# perfil de Chrome con la sesión, token del modo HTTP, audios y tests leídos
+datos/*
+# los scripts de barrido sí se versionan
+!datos/*.py

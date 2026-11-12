@@ -1,0 +1,4 @@
+mcp>=1.2
+playwright>=1.45
+faster-whisper>=1.0
+numpy
