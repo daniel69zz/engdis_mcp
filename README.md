@@ -210,5 +210,6 @@ El servidor le pasa al agente un resumen del flujo de trabajo en `instructions`,
 | `ENGDIS_DATA` | `./datos` | Perfil del navegador y caché de audios |
 | `ENGDIS_CHANNEL` | `chrome` | `""` para usar el Chromium de Playwright |
 | `ENGDIS_WHISPER` | `small.en` | Modelo de whisper (`base.en` es más rápido, `medium.en` más preciso) |
+| `ENGDIS_ESPERA` | `0.5` | Factor de las esperas mínimas tras cada carga (1 = las esperas fijas antiguas); después se espera a que no queden peticiones en vuelo |
 
 Las coordenadas de los botones de práctica y del test están pensadas para una ventana de 1512x806. Si la plataforma cambia de diseño, ajústalas en las constantes del principio de `server.py`.

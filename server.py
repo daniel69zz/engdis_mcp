@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -92,12 +93,34 @@ _pw = None
 _ctx = None
 _page = None
 _modelo = None
+_modelo_lock = threading.Lock()
+# peticiones en vuelo (para saber cuándo la SPA terminó de cargar) y estadística de esperas
+_en_vuelo: dict = {}
+_esperas = {"n": 0, "s": 0.0, "agotadas": 0}
+# las esperas mínimas fijas se multiplican por este factor (1 = como antes)
+FACTOR_ESPERA = float(os.environ.get("ENGDIS_ESPERA", "0.5"))
 
 
 def _nueva_pagina(p):
     # el Unit Test se abre en ventana emergente; se pasa a trabajar en ella
     global _page
     _page = p
+
+
+def _contexto_cerrado(*_):
+    # si se cierra la ventana de Chrome, la próxima llamada lanza el navegador de nuevo
+    global _ctx, _page
+    _ctx, _page = None, None
+    _en_vuelo.clear()
+
+
+def _red_inicio(req):
+    if req.resource_type in ("xhr", "fetch", "document", "script"):
+        _en_vuelo[req] = time.monotonic()
+
+
+def _red_fin(req):
+    _en_vuelo.pop(req, None)
 
 
 async def _pagina():
@@ -117,6 +140,10 @@ async def _pagina():
             ],
         )
         _ctx.on("page", _nueva_pagina)
+        _ctx.on("close", _contexto_cerrado)
+        _ctx.on("request", _red_inicio)
+        _ctx.on("requestfinished", _red_fin)
+        _ctx.on("requestfailed", _red_fin)
         _page = _ctx.pages[0] if _ctx.pages else await _ctx.new_page()
     if _page is None or _page.is_closed():
         vivas = [p for p in _ctx.pages if not p.is_closed()]
@@ -124,13 +151,26 @@ async def _pagina():
     return _page
 
 
-async def _esperar_carga(page, minimo=800):
-    # la plataforma es una SPA que sigue pidiendo datos tras el evento load
-    await page.wait_for_timeout(minimo)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception:
-        pass
+async def _esperar_carga(page, minimo=800, maximo=8.0):
+    # la plataforma es una SPA que sigue pidiendo datos tras el evento load. networkidle casi nunca
+    # llega (hay peticiones de fondo) y agotaba sus 8 s en cada paso: se espera a que no quede
+    # ninguna petición reciente en vuelo (las de más de 4 s se ignoran: son sondeos largos)
+    t0 = time.monotonic()
+    await page.wait_for_timeout(int(minimo * FACTOR_ESPERA))
+    quietos = 0
+    while time.monotonic() - t0 < maximo:
+        ahora = time.monotonic()
+        if any(ahora - t < 4 for t in _en_vuelo.values()):
+            quietos = 0
+        else:
+            quietos += 1
+            if quietos >= 2:
+                break
+        await page.wait_for_timeout(250)
+    else:
+        _esperas["agotadas"] += 1
+    _esperas["n"] += 1
+    _esperas["s"] += time.monotonic() - t0
 
 
 async def _eval(page, codigo, arg=None, intentos=3):
@@ -266,8 +306,48 @@ async def ir_leccion(unidad: int, leccion: int, curso: str = "") -> str:
     return await _ir_leccion(unidad, leccion, curso, True)
 
 
+# (curso, unidad) de la última lección abierta entrando por My Progress o la página de inicio
+_ubicacion = {"curso": None, "unidad": None}
+
+
+async def _ir_leccion_misma_unidad(page, leccion: int) -> bool:
+    """Cambia de lección con el desplegable de lecciones de la cabecera, sin volver a My Progress."""
+    if "learningArea" not in page.url:
+        return False
+    pos = await _eval(page, """async (l) => {
+      const s = ms => new Promise(r => setTimeout(r, ms));
+      const item = () => [...document.querySelectorAll('.learning__dropDownListW--lessons .learning__dropDownList_itemName')]
+        .find(e => e.textContent.trim().startsWith(l + '. '));
+      const dentro = e => { const r = e.getBoundingClientRect(); return r.top > 0 && r.bottom < innerHeight && r.width > 0; };
+      if (!item()) return null;
+      if (!dentro(item())) {  // el desplegable está cerrado: se abre pulsando "Lesson N: ..." de la cabecera
+        const cab = [...document.querySelectorAll('.learning__dropDownListTitle')]
+          .find(e => /^Lesson \\d+:/.test(e.textContent.trim()));
+        cab?.click(); await s(700);
+      }
+      const e = item();
+      if (!e || !dentro(e)) return null;
+      const r = e.getBoundingClientRect();
+      return [r.left + 30, r.top + r.height / 2];
+    }""", leccion)
+    if not pos:
+        return False
+    await page.mouse.click(*pos)
+    await _cerrar_aviso(page, "Continue")
+    try:
+        await page.wait_for_function("(l) => new RegExp('^Lesson ' + l + ':', 'm').test(document.body.innerText)",
+                                     arg=leccion, timeout=15000)
+    except Exception:
+        return False
+    await _esperar_carga(page, 1500)
+    return True
+
+
 async def _ir_leccion(unidad: int, leccion: int, curso: str, reintento: bool) -> str:
     page = await _pagina()
+    if curso and _ubicacion == {"curso": curso, "unidad": unidad} and await _ir_leccion_misma_unidad(page, leccion):
+        return (await estado(400))["texto"]
+    _ubicacion.update(curso=None, unidad=None)
     if curso:
         await page.goto(INICIO)
         await _esperar_carga(page)
@@ -342,6 +422,7 @@ async def _ir_leccion(unidad: int, leccion: int, curso: str, reintento: bool) ->
         return r
     await page.wait_for_url("**/learningArea**", timeout=20000)
     await _esperar_carga(page, 2500)
+    _ubicacion.update(curso=curso or None, unidad=unidad)
     return (await estado(400))["texto"]
 
 
@@ -614,8 +695,9 @@ def _transcribir(url: str, inicio, fin, vad: bool) -> str:
         return cache.read_text()
     raw = subprocess.run(cmd, check=True, capture_output=True).stdout
     x = np.frombuffer(raw, dtype=np.float32)
-    if _modelo is None:
-        _modelo = WhisperModel(MODELO_WHISPER, device="cpu", compute_type="int8")
+    with _modelo_lock:
+        if _modelo is None:
+            _modelo = WhisperModel(MODELO_WHISPER, device="cpu", compute_type="int8")
 
     def pasada(y, con_vad, desde=0.0):
         segs, _ = _modelo.transcribe(
@@ -624,7 +706,8 @@ def _transcribir(url: str, inicio, fin, vad: bool) -> str:
         )
         return [(s.start + desde, s.end + desde, s.text.strip()) for s in segs if s.text.strip()]
 
-    segmentos = pasada(x, vad)
+    with _modelo_lock:
+        segmentos = pasada(x, vad)
     # whisper a veces se salta frases en los cortes de bloque: se retranscribe cada hueco largo con voz
     dur = len(x) / 16000
     bordes = [0.0] + [v for s in segmentos for v in s[:2]] + [dur]
@@ -634,12 +717,37 @@ def _transcribir(url: str, inicio, fin, vad: bool) -> str:
         tramo = x[int(a * 16000):int(b * 16000)]
         if np.sqrt((tramo ** 2).mean()) < 0.01:  # silencio
             continue
-        segmentos += pasada(tramo, False, a)
+        with _modelo_lock:
+            segmentos += pasada(tramo, False, a)
     segmentos.sort()
     desfase = float(inicio or 0)
     texto = "\n".join(f"[{a + desfase:5.1f}-{b + desfase:5.1f}] {t}" for a, b, t in segmentos)
     cache.write_text(texto)
     return texto
+
+
+def _precargar_whisper():
+    # cargar el modelo tarda varios segundos: se hace al arrancar, en segundo plano
+    global _modelo
+    try:
+        from faster_whisper import WhisperModel
+        with _modelo_lock:
+            if _modelo is None:
+                _modelo = WhisperModel(MODELO_WHISPER, device="cpu", compute_type="int8")
+    except Exception:
+        pass
+
+
+async def _transcribir_item(u: str, dur_texto: str) -> str:
+    # transcripción de un audio de test; si sale casi vacía o mucho más corta que el reproductor,
+    # se repite sin VAD (whisper a veces se inventa "Thank you." en los videos)
+    txt = await asyncio.to_thread(_transcribir, u, None, None, True)
+    dur = re.search(r"00:00/(\d+):(\d+)", dur_texto)
+    fin = [float(x) for x in re.findall(r"-\s*([\d.]+)\]", txt)]
+    corto = bool(dur and fin and max(fin) < 0.6 * (int(dur.group(1)) * 60 + int(dur.group(2))))
+    if len(txt) < 80 or corto:
+        txt = await asyncio.to_thread(_transcribir, u, None, None, False)
+    return txt
 
 
 @mcp.tool()
@@ -1382,6 +1490,7 @@ async def prueba_leer(max_items: int = 20, imagenes: bool = True, max_segundos: 
     Después responde con prueba_responder()."""
     page = await _pagina()
     salida, oidos, anterior = [], set(), ""
+    pendientes_audio = []
     await _eval(page, "() => { window.__mcpVistas = new Set(); }")
     t0 = time.monotonic()
     for _ in range(max_items):
@@ -1419,16 +1528,10 @@ async def prueba_leer(max_items: int = 20, imagenes: bool = True, max_segundos: 
         for u in info["audios"]:  # los <audio> de ítems anteriores siguen en la página
             if u not in oidos:
                 oidos.add(u)
-                txt = await asyncio.to_thread(_transcribir, u, None, None, True)
-                # en algunos videos el VAD descarta casi todo y whisper inventa "Thank you." o
-                # "Thanks for watching!": si sale casi vacío, se repite sin VAD
-                # también si la transcripción cubre mucho menos que la duración que muestra el reproductor
-                dur = re.search(r"00:00/(\d+):(\d+)", texto)
-                fin = [float(x) for x in re.findall(r"-\s*([\d.]+)\]", txt)]
-                corto = bool(dur and fin and max(fin) < 0.6 * (int(dur.group(1)) * 60 + int(dur.group(2))))
-                if len(txt) < 80 or corto:
-                    txt = await asyncio.to_thread(_transcribir, u, None, None, False)
-                partes.append("audio: " + txt)
+                # se transcribe en segundo plano mientras el navegador pasa al siguiente ítem
+                marca = f"\x00AUDIO{len(pendientes_audio)}\x00"
+                pendientes_audio.append(asyncio.create_task(_transcribir_item(u, texto)))
+                partes.append("audio: " + marca)
         salida.append("\n".join(partes))
         # captura si las opciones son imágenes o si aparece una imagen nueva (lista de precios, horario...)
         if imagenes and info.get("cortadas") and info["nuevas"]:
@@ -1449,6 +1552,10 @@ async def prueba_leer(max_items: int = 20, imagenes: bool = True, max_segundos: 
         if not await _eval(page, "() => { const a = document.querySelector('a.learning__nextItemLink'); if (a) a.click(); return !!a; }"):
             break
         await _esperar_carga(page, 1500)
+    textos = await asyncio.gather(*pendientes_audio)
+    for k, t in enumerate(textos):
+        marca = f"\x00AUDIO{k}\x00"
+        salida = [x.replace(marca, t) if isinstance(x, str) else x for x in salida]
     return salida
 
 
@@ -1727,7 +1834,10 @@ async def leccion_completa(unidad: int, leccion: int, curso: str = "", tests: st
 async def _leccion_completa(unidad: int, leccion: int, curso: str, tests: str, log: list) -> list[str]:
     # `log` se va llenando en vivo (barrido_estado lo lee mientras corre)
     et = f"U{unidad}L{leccion}"
+    t_lec = time.monotonic()
+    esperas0 = dict(_esperas)
     r = await ir_leccion(unidad, leccion, curso)
+    log.append(f"{et} abierta ({time.monotonic() - t_lec:.0f} s)")
     page = await _pagina()
     if "learningArea" not in page.url:
         log.append(f"{et}: no abre: {_compactar(r, 200)}")
@@ -1736,8 +1846,15 @@ async def _leccion_completa(unidad: int, leccion: int, curso: str, tests: str, l
     lineas = [x.strip() for x in str(r).splitlines() if x.strip()]
     nombre_curso = lineas[1] if len(lineas) > 1 and not curso else curso
     for paso in await _eval(page, JS_PASOS):
+        t_paso = time.monotonic()
+        n_log = len(log)
         try:
             txt = await ir_paso(paso.split(".")[0])
+            if not re.search(r"test|quiz", paso, re.I) and "Start Test" not in txt:
+                # paso ya terminado: no se rehace (en cursos a medio hacer ahorra minutos)
+                if (await estado(100)).get("items_pendientes") == "ninguno":
+                    log.append(f"{et} {paso}: ya hecho, lo salto")
+                    continue
             if re.search(r"test|quiz", paso, re.I):
                 for _ in range(6):  # la portada del test tarda en pintarse
                     if "Start Test" in txt or "Your test score" in txt:
@@ -1790,7 +1907,12 @@ async def _leccion_completa(unidad: int, leccion: int, curso: str, tests: str, l
                 log.append(f"{et} {paso}: explore · " + " | ".join(x for x in res if "fin" not in x))
         except Exception as e:
             log.append(f"{et} {paso}: EXCEPCIÓN {type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}")
+        finally:
+            if len(log) > n_log:  # duración del paso al final de su línea
+                log[-1] += f" ({time.monotonic() - t_paso:.0f} s)"
     await _pendientes_leccion(log, et)
+    log.append(f"{et} esperas de carga: {_esperas['n'] - esperas0['n']} · {_esperas['s'] - esperas0['s']:.0f} s"
+               f" · agotadas {_esperas['agotadas'] - esperas0['agotadas']}")
     return log
 
 
@@ -1964,6 +2086,7 @@ def _servir_http(puerto: int):
 
 if __name__ == "__main__":
     import sys
+    threading.Thread(target=_precargar_whisper, daemon=True).start()
     if "--http" in sys.argv:
         i = sys.argv.index("--http")
         _servir_http(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 8765)
