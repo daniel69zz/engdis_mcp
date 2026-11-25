@@ -263,10 +263,20 @@ async def cursos(curso: str = "") -> dict:
 async def ir_leccion(unidad: int, leccion: int, curso: str = "") -> str:
     """Abre la lección N de la unidad U. Sin `curso` usa el curso activo de la página de inicio;
     con `curso` (parte del nombre, p. ej. "TOEIC Bridge") entra por My Progress a ese curso."""
+    return await _ir_leccion(unidad, leccion, curso, True)
+
+
+async def _ir_leccion(unidad: int, leccion: int, curso: str, reintento: bool) -> str:
     page = await _pagina()
     if curso:
         await page.goto(INICIO)
         await _esperar_carga(page)
+        # si se venía de My Progress, goto solo cambia el hash y la vista vieja sigue un momento:
+        # se espera a que la SPA pinte de verdad la página de inicio
+        try:
+            await page.wait_for_function("() => location.hash.includes('home') && !document.querySelector('[ng-click^=\"myProgressUnitsCtrl\"]')", timeout=8000)
+        except Exception:
+            pass
         r = await _eval(page, JS_MI_PROGRESO, curso)
         if r != "ok" and str(r).startswith("No encuentro el curso"):
             # el curso abierto no sale en la lista de My Progress: si es el de la página de inicio, se usa ese
@@ -278,6 +288,10 @@ async def ir_leccion(unidad: int, leccion: int, curso: str = "") -> str:
                     return await ir_leccion(unidad, leccion, "")
                 await page.wait_for_timeout(500)
         if r != "ok":
+            # recién iniciada la sesión, My Progress a veces aún no lista el curso: se repite una vez
+            if reintento and str(r).startswith("No encuentro el curso"):
+                await page.wait_for_timeout(3000)
+                return await _ir_leccion(unidad, leccion, curso, False)
             return str(r)
         codigo = """async ([u, l]) => {
           const s = ms => new Promise(r => setTimeout(r, ms));
@@ -323,6 +337,8 @@ async def ir_leccion(unidad: int, leccion: int, curso: str = "") -> str:
             raise
         r = "ok"
     if r != "ok":
+        if reintento and curso and "(hay 0)" in str(r):  # My Progress aún sin pintar: se repite una vez
+            return await _ir_leccion(unidad, leccion, curso, False)
         return r
     await page.wait_for_url("**/learningArea**", timeout=20000)
     await _esperar_carga(page, 2500)
@@ -907,8 +923,11 @@ JS_HABLA_CORRECTA = """() => {
   const t = document.body.innerText;
   const mic = /Speech Recognition|record the correct answer|Speak now|Try again/.test(t)
     || [...document.querySelectorAll('a,button,div,span')].some(e => e.offsetParent && e.children.length === 0 && e.textContent.trim() === 'Start');
-  const c = [...document.querySelectorAll('.lessonMultipleAnswer.c')].find(e => e.offsetParent);
-  return mic && c ? (c.querySelector('.multiTextInline') || c).textContent.trim().replace(/\\s+/g, ' ') : null; }"""
+  const cs = [...document.querySelectorAll('.lessonMultipleAnswer.c')].filter(e => e.offsetParent);
+  // la respuesta hablada tiene una sola correcta; con varias ("Choose three correct answers") son casillas
+  if (cs.length !== 1) return null;
+  const c = cs[0];
+  return mic && c ?(c.querySelector('.multiTextInline') || c).textContent.trim().replace(/\\s+/g, ' ') : null; }"""
 
 # casillas "Which facts are true...?" (div.lessonMultipleAnswer, sin input): las correctas traen la clase `c`
 # y la seleccionada añade `check`. Se marcan con clics reales sobre su texto.
@@ -946,10 +965,7 @@ async def _responder_hablando(page) -> str:
             await page.wait_for_timeout(1000)
         await speaking_frase(frase)
         boton = "Try again" if "Try again" in t else "Start"
-        try:
-            await page.get_by_text(boton, exact=True).first.click(timeout=5000)
-        except Exception:
-            pass
+        await _clic_boton(page, boton)
         for _ in range(25):
             await page.wait_for_timeout(1000)
             if await _eval(page, JS_ITEM_HECHO):
@@ -1005,19 +1021,30 @@ async def practica_escribir(texto: str) -> str:
     editor (TinyMCE dentro de un iframe, o textarea) con el teclado real y pulsa Done.
     El texto lo redacta el agente según la consigna del ítem (léela con estado())."""
     page = await _pagina()
-    editor = page.locator("td.mceIframeContainer iframe:visible").first
+    editor = page.locator("td.mceIframeContainer iframe:visible, iframe[id^='mce_'][id$='_ifr']:visible").first
     if not await editor.count():
         editor = page.locator("textarea:visible").first
     if not await editor.count():
         return "no encuentro el recuadro de escritura"
-    # clic real de ratón en el centro del recuadro: el clic del localizador sobre el iframe
-    # a veces no deja el foco dentro del editor y las teclas se pierden
+    # el foco tiene que quedar dentro del editor o las teclas se pierden. Se prueba, en orden: clic real
+    # de ratón en el recuadro, clic en el body del iframe y foco por JS; tras cada uno se comprueba
+    es_iframe = await editor.evaluate("e => e.tagName === 'IFRAME'")
+    foco_js = """() => { const a = document.activeElement;
+      return !!a && (a.tagName === 'TEXTAREA' || (a.tagName === 'IFRAME' && a.contentDocument.hasFocus())); }"""
     caja = await editor.bounding_box()
-    if caja:
-        await page.mouse.click(caja["x"] + caja["width"] / 2, caja["y"] + min(40, caja["height"] / 2))
-    else:
-        await editor.click(timeout=5000)
-    await page.wait_for_timeout(300)
+    for intento in range(3):
+        if intento == 0 and caja:
+            await page.mouse.click(caja["x"] + caja["width"] / 2, caja["y"] + min(40, caja["height"] / 2))
+        elif intento == 1 and es_iframe:
+            sel = await editor.evaluate("e => '#' + e.id")
+            await page.frame_locator(sel).locator("body").click(timeout=5000)
+        elif intento == 2 and es_iframe:
+            await editor.evaluate("e => { e.focus(); e.contentWindow.focus(); e.contentDocument.body.focus(); }")
+        else:
+            await editor.click(timeout=5000)
+        await page.wait_for_timeout(300)
+        if await _eval(page, foco_js):
+            break
     await page.keyboard.press("Meta+A")
     await page.keyboard.press("Backspace")
     await page.keyboard.type(texto, delay=5)
@@ -1241,6 +1268,13 @@ async def explorar(max_items: int = 20, max_segundos: int = 45) -> list[str]:
         # play con un clic real: basta con que empiece a sonar, no hace falta oírlo entero.
         # Con play() por JS el audio suena completo pero el ítem no cuenta.
         boton = page.locator(".layout__mediaPlayPause--play:visible, .CTrackerPlayBtnD:visible").first
+        if not await boton.count() and not await _eval(page, JS_ITEM_HECHO):
+            # con red lenta (videos) el reproductor tarda en pintarse; sin esperar se caía al play()
+            # por JS, que suena pero no cuenta
+            try:
+                await boton.wait_for(state="visible", timeout=8000)
+            except Exception:
+                pass
         if await boton.count():
             pos = await _eval(page, "() => (document.body.innerText.match(/(\\d+) \\/ (\\d+)/) || [])[0] || '?'")
             await boton.click(timeout=5000)
@@ -1334,7 +1368,10 @@ JS_PRUEBA_ITEM = """() => {
   // desplegables (ed-select-options): opciones de cada uno
   const desplegables = [...document.querySelectorAll('ed-select-options')].filter(vis)
     .map(d => [...d.querySelectorAll('.DDLOptions__listItem')].map(o => o.textContent.trim()));
-  return {pos, audios, caja, nuevas: nuevas.length, fichas, huecos, preguntas, desplegables};
+  // imágenes que no caben en la ventana (lecturas largas como imagen): la captura las cortaría
+  const cortadas = base.filter(i => { const r = i.getBoundingClientRect(); return r.bottom > innerHeight - 50 || r.top < 0; })
+    .map(i => i.currentSrc || i.src);
+  return {pos, audios, caja, nuevas: nuevas.length, fichas, huecos, preguntas, desplegables, cortadas};
 }"""
 
 
@@ -1394,7 +1431,15 @@ async def prueba_leer(max_items: int = 20, imagenes: bool = True, max_segundos: 
                 partes.append("audio: " + txt)
         salida.append("\n".join(partes))
         # captura si las opciones son imágenes o si aparece una imagen nueva (lista de precios, horario...)
-        if imagenes and info["caja"] and (re.search(r"^\(A\)$", texto, re.M) or info["nuevas"]):
+        if imagenes and info.get("cortadas") and info["nuevas"]:
+            # la imagen es más alta que la ventana: se descarga entera (con la sesión del navegador)
+            for src in info["cortadas"]:
+                try:
+                    r = await page.context.request.get(src)
+                    salida.append(Image(data=await r.body(), format=src.rsplit(".", 1)[-1].split("?")[0].lower().replace("jpg", "jpeg")))
+                except Exception as e:
+                    salida.append(f"no pude descargar la imagen {src}: {e}")
+        elif imagenes and info["caja"] and (re.search(r"^\(A\)$", texto, re.M) or info["nuevas"]):
             x0, y0, x1, y1 = info["caja"]
             salida.append(await _jpeg(page, {"x": max(x0, 0), "y": max(y0, 0), "width": x1 - max(x0, 0),
                                              "height": y1 - max(y0, 0)}, 45))
@@ -1553,6 +1598,20 @@ AVISOS_HABLA = ("Speak now.", "Prepare to speak...", "Click 'Try again' to repea
 ATASCO_HABLA = 30  # segundos en "Prepare to speak..." a partir de los cuales se da el speaking por atascado
 
 
+async def _clic_boton(page, texto: str) -> bool:
+    """Clic real en el botón visible con ese texto exacto, fuera de la cabecera de la lección
+    (allí hay un desplegable que también se llama "Start" y no responde al clic)."""
+    pos = await _eval(page, """(t) => {
+      const c = [...document.querySelectorAll('a,button,div,span')].filter(e => e.offsetParent
+        && e.children.length === 0 && e.textContent.trim() === t && !e.closest('[class*=dropDownList], header'))
+        .map(e => e.getBoundingClientRect()).filter(r => r.width && r.top > 70);
+      return c.length ? [c[0].left + c[0].width / 2, c[0].top + c[0].height / 2] : null; }""", texto)
+    if not pos:
+        return False
+    await page.mouse.click(*pos)
+    return True
+
+
 @mcp.tool()
 async def speaking_conversacion(personaje: str = "derecha", max_segundos: int = 240) -> list[str]:
     """Hace sola una conversación de speaking (paso Interact): elige el personaje (`derecha` o `izquierda`
@@ -1572,7 +1631,8 @@ async def speaking_conversacion(personaje: str = "derecha", max_segundos: int = 
     # (div.recordingPanelSentence), así que digo la primera que sale debajo del botón
     ramificada = "branching conversation" in texto or "begin the conversation" in texto
     if "begin the conversation" in texto:
-        await page.get_by_text("Start", exact=True).first.click(timeout=5000)
+        if not await _clic_boton(page, "Start"):
+            raise RuntimeError("no encuentro el botón Start")
         log.append("conversación ramificada: Start")
         await page.wait_for_timeout(1500)
     if "Click on the arrow" in texto:
@@ -1585,7 +1645,8 @@ async def speaking_conversacion(personaje: str = "derecha", max_segundos: int = 
         x, y = flechas[-1] if personaje.startswith("d") else flechas[0]
         await page.mouse.click(x, y)
         await page.wait_for_timeout(800)
-        await page.get_by_text("Start", exact=True).first.click(timeout=5000)
+        if not await _clic_boton(page, "Start"):
+            raise RuntimeError("no encuentro el botón Start")
         log.append(f"personaje: {personaje}")
     ultima, intentos, quietos = None, 0, 0
     preparando = None  # desde cuándo está en "Prepare to speak..." sin pasar a "Speak now."
@@ -1617,7 +1678,8 @@ async def speaking_conversacion(personaje: str = "derecha", max_segundos: int = 
                     if intentos > 5:
                         log.append("demasiados Try again; me detengo")
                         break
-                    await page.get_by_text("Try again", exact=True).first.click(timeout=5000)
+                    if not await _clic_boton(page, "Try again"):
+                        log.append("no encuentro el botón Try again")
         elif ultima:
             quietos += 1
             if quietos >= 3 and await _eval(page, JS_ITEM_HECHO):
@@ -1683,6 +1745,10 @@ async def _leccion_completa(unidad: int, leccion: int, curso: str, tests: str, l
                     await page.wait_for_timeout(2000)
                     txt = (await estado(600))["texto"]
             if "Start Test" in txt or "Your test score" in txt:
+                nota = re.search(r"score is:?\s*(\d+)\s*%|^(\d+)\s*%\s*\n\s*Start Test", txt, re.M)
+                if nota and (nota.group(1) or nota.group(2)) == "100":  # ya aprobado del todo: no hace falta leerlo
+                    log.append(f"{et} {paso}: test ya al 100 %")
+                    continue
                 if tests != "leer":
                     log.append(f"{et} {paso}: test sin hacer")
                     continue
@@ -1701,7 +1767,8 @@ async def _leccion_completa(unidad: int, leccion: int, curso: str, tests: str, l
                         f.write_bytes(x.data)
                         partes.append(f"<imagen {f}>")
                 (carpeta / f"{base}.txt").write_text("\n".join(partes))
-                log.append(f"{et} {paso}: test leído → {carpeta / (base + '.txt')}")
+                previa = f" (nota anterior {nota.group(1) or nota.group(2)} %)" if nota else ""
+                log.append(f"{et} {paso}: test leído{previa} → {carpeta / (base + '.txt')}")
                 continue
             await ir_item(1)
             if "Select the speaker" in txt or "Speech Recognition" in txt or re.search(r"interact", paso, re.I):
